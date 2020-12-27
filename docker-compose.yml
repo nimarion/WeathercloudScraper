@@ -1,19 +1,28 @@
-version: '3'
+version: "3"
 services:
-  bot:
+  weather:
     image: "biospheere/weathercloudscraper"
     restart: always
     env_file: .env
     depends_on:
-    - db
+      - db
   db:
     image: mysql:8
     restart: always
-    container_name: mysql 
+    container_name: mysql
     env_file: .env
     volumes:
-    - mysql-volume:/var/lib/mysql
-
+      - mysql-volume:/var/lib/mysql
+  grafana:
+    image: "grafana/grafana"
+    restart: always
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - weather
 
 volumes:
   mysql-volume:
+  grafana_data:
