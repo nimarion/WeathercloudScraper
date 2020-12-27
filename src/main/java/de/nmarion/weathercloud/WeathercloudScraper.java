@@ -55,7 +55,12 @@ public class WeathercloudScraper extends TimerTask{
             }
 
             public void onResponse(Call call, Response response) throws IOException {
-                future.complete(GSON.fromJson(response.body().string(), WeatherData.class));
+                final String body = response.body().string();
+                if(body.isEmpty() || body.equals("[]")){
+                    future.completeExceptionally(new NullPointerException("Body is empty"));
+                } else {
+                    future.complete(GSON.fromJson(body, WeatherData.class));
+                }
             }
         });
         return future;
