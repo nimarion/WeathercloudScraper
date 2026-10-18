@@ -1,81 +1,88 @@
 package de.nmarion.weathercloud;
 
-import java.util.Arrays;
+import io.prometheus.metrics.exporter.httpserver.HTTPServer;
+import io.prometheus.metrics.instrumentation.jvm.JvmMetrics;
+import java.io.IOException;
 import java.util.List;
-import java.util.Timer;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import de.nmarion.weathercloud.database.Database;
-import de.nmarion.weathercloud.database.MySqlDatabase;
-import io.sentry.Sentry;
-
-public class Weathercloud {
+public class Weathercloud implements AutoCloseable {
 
     private static final Logger logger = LoggerFactory.getLogger(Weathercloud.class);
 
-    private final Database database;
-    private final List<String> deviceIds;
+    private final Configuration configuration;
+    private final WeatherMetrics metrics;
+    private final HTTPServer httpServer;
+    private final ScheduledExecutorService scheduler;
 
-    public Weathercloud() {
+    public Weathercloud() throws IOException {
+        this(Configuration.load());
+    }
+
+    public Weathercloud(final Configuration configuration) throws IOException {
         final long startTime = System.currentTimeMillis();
-        logger.info("Starting WeathercloudScraper");
+        logger.info("Starting WeathercloudScraper...");
 
-        if (Configuration.DEVICES == null) {
-            throw new RuntimeException("Enviroment variable DEVICES is missing!");
-        }
-        deviceIds = Arrays.asList(Configuration.DEVICES.split(" "));
+        this.configuration = configuration;
 
-        database = new MySqlDatabase(Configuration.DATABASE_HOST, Configuration.DATABASE_USER,
-                Configuration.DATABASE_PASSWORD,
-                Configuration.DATABASE_NAME == null ? "WeathercloudScraper" : Configuration.DATABASE_NAME,
-                Configuration.DATABASE_PORT == null ? 3306 : Integer.valueOf(Configuration.DATABASE_PORT));
-        logger.info("Database-Connection set up!");
+        JvmMetrics.builder().register();
+        this.metrics = new WeatherMetrics();
 
-        final Timer timer = new Timer("Scrape Timer");
-        timer.schedule(new WeathercloudScraper(this), 100, TimeUnit.MINUTES.toMillis(10));
-        logger.info("Timer Task started");
+        this.httpServer = HTTPServer.builder()
+                .port(configuration.metricsPort())
+                .buildAndStart();
+        logger.info("Prometheus HTTP server listening on port {} (/metrics)", httpServer.getPort());
 
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            try {
-                timer.cancel();
-                database.close();
-            } catch (final Exception e) {
-                e.printStackTrace();
-            }
-        }));
+        this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            final Thread thread = new Thread(r, "weathercloud-scraper");
+            thread.setDaemon(false);
+            return thread;
+        });
 
-        logger.info(String.format("Startup finished in %dms!", System.currentTimeMillis() - startTime));
+        final WeathercloudScraper scraper = new WeathercloudScraper(configuration.devices(), metrics);
+        scheduler.scheduleAtFixedRate(
+                scraper,
+                0L,
+                configuration.scrapeIntervalSeconds(),
+                TimeUnit.SECONDS
+        );
+        logger.info("Scheduled scraper for {} device(s) every {}s",
+                configuration.devices().size(), configuration.scrapeIntervalSeconds());
+
+        Runtime.getRuntime().addShutdownHook(new Thread(this::close, "weathercloud-shutdown"));
+
+        logger.info("Startup finished in {}ms!", System.currentTimeMillis() - startTime);
     }
 
-     /**
-     * @return the database
-     */
-    public Database getDatabase() {
-        return database;
-    }
-
-    /**
-     * @return the deviceIds
-     */
     public List<String> getDeviceIds() {
-        return deviceIds;
+        return configuration.devices();
     }
 
-    /**
-     * @return the logger
-     */
-    public Logger getLogger() {
-        return logger;
+    public WeatherMetrics getMetrics() {
+        return metrics;
     }
 
-    public static void main(String... args) {
-        if (System.getenv("SENTRY_DSN") != null || System.getProperty("sentry.properties") != null) {
-            Sentry.init();
+    public int getMetricsPort() {
+        return httpServer.getPort();
+    }
+
+    @Override
+    public void close() {
+        logger.info("Shutting down WeathercloudScraper...");
+        scheduler.shutdownNow();
+        httpServer.close();
+    }
+
+    public static void main(final String... args) {
+        try {
+            new Weathercloud();
+        } catch (final Exception ex) {
+            logger.error("Failed to start WeathercloudScraper", ex);
+            System.exit(1);
         }
-        new Weathercloud();
     }
-   
 }

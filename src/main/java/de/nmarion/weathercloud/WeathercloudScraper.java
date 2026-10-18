@@ -1,69 +1,108 @@
 package de.nmarion.weathercloud;
 
-import java.io.IOException;
-import java.util.TimerTask;
-import java.util.concurrent.CompletableFuture;
-
 import com.google.gson.Gson;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import okhttp3.Call;
-import okhttp3.Callback;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
+public class WeathercloudScraper implements Runnable {
 
-public class WeathercloudScraper extends TimerTask{
-
+    private static final Logger logger = LoggerFactory.getLogger(WeathercloudScraper.class);
+    private static final String DEFAULT_BASE_URL = "https://app.weathercloud.net";
     private static final Gson GSON = new Gson();
-    private final OkHttpClient okHttpClient;
 
-    private final Weathercloud weathercloud;
+    private final List<String> deviceIds;
+    private final WeatherMetrics metrics;
+    private final HttpClient httpClient;
+    private final String baseUrl;
 
-    public WeathercloudScraper(final Weathercloud weathercloud){
-        this.weathercloud = weathercloud;
-        this.okHttpClient = new OkHttpClient();
+    public WeathercloudScraper(final List<String> deviceIds, final WeatherMetrics metrics) {
+        this(
+                deviceIds,
+                metrics,
+                HttpClient.newBuilder()
+                        .connectTimeout(Duration.ofSeconds(10))
+                        .followRedirects(HttpClient.Redirect.NORMAL)
+                        .build(),
+                DEFAULT_BASE_URL
+        );
     }
-    
+
+    public WeathercloudScraper(
+            final List<String> deviceIds,
+            final WeatherMetrics metrics,
+            final HttpClient httpClient,
+            final String baseUrl
+    ) {
+        this.deviceIds = List.copyOf(deviceIds);
+        this.metrics = metrics;
+        this.httpClient = httpClient;
+        this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+    }
+
     @Override
     public void run() {
-        for(String device : weathercloud.getDeviceIds()){
-            loadCurrentData(Long.valueOf(device)).whenComplete((data, throwable) -> {
-                long timestamp = data.getEpoch();
-                float temperature = data.getTemp();
-                int humidity = data.getHum();
-                float bar = data.getBar();
-                float dew = data.getDew();
-                float windchill = data.getChill();
-                float rain = data.getRain();
-                float windspeed = data.getWspd();
-                int winddirection = data.getWdir();
-                float gustwind = data.getWspdhi();
-                weathercloud.getDatabase().insert(Long.valueOf(device), timestamp, temperature, humidity, bar, dew, windchill, rain, windspeed, winddirection, gustwind);
-                weathercloud.getLogger().info("Inserted data for device " + device);
-            });
+        for (final String device : deviceIds) {
+            scrapeDevice(device);
         }
     }
 
-    private CompletableFuture<WeatherData> loadCurrentData(long deviceId) {
-        final CompletableFuture<WeatherData> future = new CompletableFuture<WeatherData>();
-        final Request request = new Request.Builder().url("https://app.weathercloud.net/device/values?code=" + deviceId)
-                .header("X-Requested-With", "XMLHttpRequest").build();
-        okHttpClient.newCall(request).enqueue(new Callback() {
-
-            public void onFailure(Call call, IOException exception) {
-                future.completeExceptionally(exception);
+    public CompletableFuture<WeatherData> scrapeDevice(final String device) {
+        final long startNanos = System.nanoTime();
+        return loadCurrentData(device).whenComplete((data, throwable) -> {
+            final double durationSeconds = (System.nanoTime() - startNanos) / 1_000_000_000.0;
+            if (throwable != null || data == null) {
+                metrics.recordScrapeResult(device, false, durationSeconds);
+                logger.warn("Failed to scrape data for device {}: {}", device,
+                        throwable != null ? throwable.getMessage() : "Empty response");
+                return;
             }
-
-            public void onResponse(Call call, Response response) throws IOException {
-                final String body = response.body().string();
-                if(body.isEmpty() || body.equals("[]")){
-                    future.completeExceptionally(new NullPointerException("Body is empty"));
-                } else {
-                    future.complete(GSON.fromJson(body, WeatherData.class));
-                }
-            }
+            metrics.update(device, data);
+            metrics.recordScrapeResult(device, true, durationSeconds);
+            logger.info("Updated Prometheus metrics for device {} (temp={}°C, hum={}%)",
+                    device, data.temp(), data.hum());
         });
-        return future;
     }
-    
+
+    public CompletableFuture<WeatherData> loadCurrentData(final String deviceId) {
+        final String endpointType = isMetarCode(deviceId) ? "metar" : "device";
+        final String encodedCode = URLEncoder.encode(deviceId, StandardCharsets.UTF_8);
+        final URI uri = URI.create(baseUrl + "/" + endpointType + "/values?code=" + encodedCode);
+
+        final HttpRequest request = HttpRequest.newBuilder(uri)
+                .GET()
+                .timeout(Duration.ofSeconds(15))
+                .header("X-Requested-With", "XMLHttpRequest")
+                .header("User-Agent", "Mozilla/5.0 (compatible; WeathercloudScraper/1.0)")
+                .header("Accept", "application/json")
+                .build();
+
+        return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                .thenApply(response -> {
+                    if (response.statusCode() != 200) {
+                        throw new IllegalStateException("Unexpected HTTP status " + response.statusCode());
+                    }
+                    final String body = response.body();
+                    if (body == null || body.isBlank() || body.trim().equals("[]")) {
+                        throw new IllegalStateException("Response body is empty or station is offline");
+                    }
+                    final WeatherData data = GSON.fromJson(body, WeatherData.class);
+                    if (data == null || data.epoch() == null) {
+                        throw new IllegalStateException("Invalid WeatherData payload: " + body);
+                    }
+                    return data;
+                });
+    }
+
+    private static boolean isMetarCode(final String id) {
+        return id != null && id.length() == 4 && id.chars().allMatch(Character::isLetter);
+    }
 }

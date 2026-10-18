@@ -1,9 +1,14 @@
-FROM maven:3.6.3-openjdk-15 AS build  
-COPY src /usr/src/app/src  
-COPY pom.xml /usr/src/app  
-RUN mvn -f /usr/src/app/pom.xml clean package
+FROM maven:3.9-eclipse-temurin-21-alpine AS build
+WORKDIR /usr/src/app
+COPY pom.xml .
+RUN mvn dependency:go-offline -B
+COPY src ./src
+RUN mvn clean package -DskipTests -B
 
-FROM openjdk:15-jdk-slim
-COPY --from=build /usr/src/app/target/WeathercloudScraper-*-SNAPSHOT-shaded.jar weathercloud.jar
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+COPY --from=build /usr/src/app/target/WeathercloudScraper-*-SNAPSHOT-shaded.jar /app/weathercloud.jar
 
-ENTRYPOINT ["java", "-jar", "weathercloud.jar" ]
+EXPOSE 8080
+
+ENTRYPOINT ["java", "-jar", "/app/weathercloud.jar"]
